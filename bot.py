@@ -39,10 +39,11 @@ def detect_funnel(raw_name):
 def append_to_sheet(sheet_name, row_data):
     url = f"https://script.google.com/macros/s/{os.environ.get('APPS_SCRIPT_ID', '')}/exec"
     if not os.environ.get('APPS_SCRIPT_ID'):
-        logging.info(f"No APPS_SCRIPT_ID, skipping sheet write")
+        logging.info("No APPS_SCRIPT_ID, skipping sheet write")
         return False
     try:
-        r = requests.post(url, json={"sheet": sheet_name, "row": row_data}, timeout=10)
+        r = requests.post(url, json={"sheet": sheet_name, "row": row_data}, timeout=15)
+        logging.info(f"Sheet write response: {r.text}")
         return r.status_code == 200
     except Exception as e:
         logging.error(f"Sheet write error: {e}")
@@ -54,9 +55,9 @@ def get_last_row(sheet_name):
         return None
     try:
         r = requests.get(url, timeout=10)
-        if r.status_code == 200:
+        if r.status_code == 200 and r.text != '[]':
             data = r.json()
-            if data:
+            if data and isinstance(data, list):
                 return dict(zip(SHEET_COLUMNS, data))
     except Exception as e:
         logging.error(f"Sheet read error: {e}")
@@ -65,13 +66,42 @@ def get_last_row(sheet_name):
 def analyze_with_claude(image_bytes):
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
 
-    prompt = """Это еженедельный отчёт по автоворонке. В таблице две колонки цифр: левая — ПЛАН (недельный), правая — ФАКТ (накопленный на дату).
+    prompt = """Это еженедельный отчёт по автоворонке. В таблице ДВЕ колонки с цифрами:
+- Левая колонка — ПЛАН на неделю
+- Правая колонка — ФАКТ (накопленный на текущую дату)
 
-Извлеки данные и верни ТОЛЬКО валидный JSON без markdown и пояснений:
+ВАЖНО: извлекай данные ТОЛЬКО из правой колонки ФАКТ.
+
+Вот точные названия строк в таблице и соответствующие поля JSON:
+- "Бюджет трафик" → budget_traffic
+- "Ежедневный бюджет" → daily_budget  
+- "Кол-во регистраций" → registrations
+- "Цена лида" → lead_price
+- "Кол-во зрителей пик по 1 дню" → viewers_peak_1day
+- "Доходимость (по 1му дню)" → reach_1day
+- "Кол-во зрителей по всем пиками" или "Кол-во зрителей по всем пикам" → viewers_all_peaks
+- "Доходимость (по всем пикам)" → reach_all_peaks
+- "Кол-во заявок" → applications
+- "Конверсия в заявку (пик всех дней)" или "Конверсия в заявку" → conversion_to_app
+- "Процент от регистрации в заявку" → reg_to_app_pct
+- "Кол-во продаж" → sales
+- "Конверсия в оплату" → conversion_to_payment
+- "Кол-во автооплат" → autopayments
+- "Конверсия в автооплату" → conversion_to_autopayment
+- "Средний чек ФАКТ ОПЛАТ" → avg_check
+- "Сумма продаж (факт)" → total_sales
+- "ROAS факт" → roas_fact
+- "Остаток оплат" → payment_remainder
+- "Потенциальный ROAS" → potential_roas
+- "Средняя стоимость заявки" → avg_app_cost
+- "Кол-во ОЖОП" → ojop_count
+- "Сумма ОЖОП" → ojop_sum
+
+Верни ТОЛЬКО валидный JSON без markdown и пояснений:
 {
-  "funnel": "название воронки из зелёной шапки",
-  "period": "период (например 13-19)",
-  "date": "дата факта из шапки правой колонки",
+  "funnel": "название воронки из цветной шапки таблицы",
+  "period": "период недели (например 13-19)",
+  "date": "дата из шапки правой колонки (например 18.05.2026)",
   "plan": {
     "budget_traffic": число или null,
     "daily_budget": число или null,
@@ -117,15 +147,13 @@ def analyze_with_claude(image_bytes):
     "ojop_count": число или null,
     "ojop_sum": число или null
   },
-  "analysis": "Аналитический вывод на русском (3-5 предложений). Сравни факт с планом по % показателям (доходимость, конверсии, ROAS) — выполняем план или нет. Отметь что идёт хорошо, где просадки. Стиль: лаконично, по делу, как опытный маркетолог. НЕ сравнивай бюджет трафик и кол-во регистраций (они накопительные)."
+  "analysis": "Аналитический вывод на русском (3-5 предложений). Сравни факт с планом по % показателям (доходимость, конверсии, ROAS). Отметь что идёт хорошо, где просадки. Стиль: лаконично, как опытный маркетолог. НЕ сравнивай бюджет трафик и кол-во регистраций."
 }
 
-Правила:
-- Проценты: число без знака % (55 а не 55%)
-- Доллары: число без знака $ (1540 а не $1540)
-- #DIV/0!, пусто, прочерк → null
-- viewers_all_peaks — строка "Кол-во зрителей по всем пиками" или "Кол-во зрителей по всем пикам" — правая колонка факта
-- viewers_peak_1day — строка "Кол-во зрителей пик по 1 дню" или "Кол-во зрителей пик по 1 дню" — правая колонка факта"""
+Правила форматирования:
+- Проценты → число без знака % (28 а не 28%)
+- Доллары → число без знака $ (993 а не $993)
+- #DIV/0!, пусто, прочерк → null"""
 
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -179,12 +207,19 @@ def fmt_with_plan(fact_val, plan_val, suffix="", higher_is_better=True, prev_val
             sign = "+" if diff > 0 else ""
             result += f" {emoji} (план {plan_val}{suffix}, {sign}{diff:.1f}{suffix})"
     if prev_val is not None:
-        delta = fact_val - prev_val
-        if delta != 0:
-            sign = "+" if delta > 0 else ""
-            arr = "↑" if delta > 0 else "↓"
-            result += f" {arr}{sign}{delta:.1f}{suffix} к вчера"
+        try:
+            delta = float(fact_val) - float(prev_val)
+            if delta != 0:
+                sign = "+" if delta > 0 else ""
+                arr = "↑" if delta > 0 else "↓"
+                result += f" {arr}{sign}{delta:.1f}{suffix} к вчера"
+        except (TypeError, ValueError):
+            pass
     return result
+
+def v(f, key):
+    val = f.get(key)
+    return val if val is not None else "—"
 
 def build_summary(parsed, prev=None):
     f = parsed.get("fact", {})
@@ -195,37 +230,33 @@ def build_summary(parsed, prev=None):
     analysis = parsed.get("analysis", "")
     prev = prev or {}
 
-    def val(key, default="—"):
-        v = f.get(key)
-        return v if v is not None else default
-
     lines = [
         f"📊 *{funnel}* | Неделя {period} | {date}",
         "",
         "💸 *Бюджет*",
-        f"  Бюджет трафик: ${val('budget_traffic')} (план ${p.get('budget_traffic', '—')})",
+        f"  Бюджет трафик: ${v(f,'budget_traffic')} (план ${p.get('budget_traffic','—')})",
         f"  Ежедневный бюджет: {fmt_with_plan(f.get('daily_budget'), p.get('daily_budget'), '$', higher_is_better=False)}",
         "",
         "🎯 *Трафик*",
-        f"  Регистрации: {val('registrations')} (план {p.get('registrations', '—')})",
+        f"  Регистрации: {v(f,'registrations')} (план {p.get('registrations','—')})",
         f"  Цена лида: {fmt_with_plan(f.get('lead_price'), p.get('lead_price'), '$', higher_is_better=False, prev_val=prev.get('lead_price'))}",
-        f"  Зрители пик 1д: {val('viewers_peak_1day')}",
+        f"  Зрители пик 1д: {v(f,'viewers_peak_1day')}",
         f"  Доходимость 1д: {fmt_with_plan(f.get('reach_1day'), p.get('reach_1day'), '%', prev_val=prev.get('reach_1day'))}",
-        f"  Зрители все пики: {val('viewers_all_peaks')}",
+        f"  Зрители все пики: {v(f,'viewers_all_peaks')}",
         f"  Доходимость все пики: {fmt_with_plan(f.get('reach_all_peaks'), p.get('reach_all_peaks'), '%', prev_val=prev.get('reach_all_peaks'))}",
         "",
         "📋 *Заявки и продажи*",
-        f"  Заявки: {val('applications')} (план {p.get('applications', '—')})",
+        f"  Заявки: {v(f,'applications')} (план {p.get('applications','—')})",
         f"  Конверсия в заявку: {fmt_with_plan(f.get('conversion_to_app'), p.get('conversion_to_app'), '%', prev_val=prev.get('conversion_to_app'))}",
         f"  % рег в заявку: {fmt_with_plan(f.get('reg_to_app_pct'), p.get('reg_to_app_pct'), '%', prev_val=prev.get('reg_to_app_pct'))}",
-        f"  Продажи: {val('sales')} (план {p.get('sales', '—')})",
+        f"  Продажи: {v(f,'sales')} (план {p.get('sales','—')})",
         f"  Конверсия в оплату: {fmt_with_plan(f.get('conversion_to_payment'), p.get('conversion_to_payment'), '%', prev_val=prev.get('conversion_to_payment'))}",
-        f"  Автооплаты: {val('autopayments')} (план {p.get('autopayments', '—')})",
+        f"  Автооплаты: {v(f,'autopayments')} (план {p.get('autopayments','—')})",
         f"  Конверсия в автооплату: {fmt_with_plan(f.get('conversion_to_autopayment'), p.get('conversion_to_autopayment'), '%', prev_val=prev.get('conversion_to_autopayment'))}",
         "",
         "💰 *Деньги*",
-        f"  Средний чек: ${val('avg_check')} (план ${p.get('avg_check', '—')})",
-        f"  Сумма продаж: ${val('total_sales')} (план ${p.get('total_sales', '—')})",
+        f"  Средний чек: ${v(f,'avg_check')} (план ${p.get('avg_check','—')})",
+        f"  Сумма продаж: ${v(f,'total_sales')} (план ${p.get('total_sales','—')})",
         f"  ROAS факт: {fmt_with_plan(f.get('roas_fact'), p.get('roas_fact'), '%', prev_val=prev.get('roas_fact'))}",
         f"  Потенциальный ROAS: {fmt_with_plan(f.get('potential_roas'), p.get('potential_roas'), '%', prev_val=prev.get('potential_roas'))}",
         f"  Ср. стоимость заявки: ${fmt_with_plan(f.get('avg_app_cost'), p.get('avg_app_cost'), higher_is_better=False, prev_val=prev.get('avg_app_cost'))}",
@@ -235,8 +266,8 @@ def build_summary(parsed, prev=None):
         lines += [
             "",
             "🔄 *ОЖОП*",
-            f"  Кол-во: {val('ojop_count')}",
-            f"  Сумма: ${val('ojop_sum')}",
+            f"  Кол-во: {v(f,'ojop_count')}",
+            f"  Сумма: ${v(f,'ojop_sum')}",
         ]
 
     if analysis:
