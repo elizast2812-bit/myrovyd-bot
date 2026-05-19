@@ -67,7 +67,7 @@ def analyze_with_claude(image_bytes):
 
     prompt = """Это еженедельный отчёт по автоворонке. В таблице две колонки цифр: левая — ПЛАН (недельный), правая — ФАКТ (накопленный на дату).
 
-Шаг 1. Извлеки данные и верни JSON:
+Извлеки данные и верни ТОЛЬКО валидный JSON без markdown и пояснений:
 {
   "funnel": "название воронки из зелёной шапки",
   "period": "период (например 13-19)",
@@ -117,14 +117,15 @@ def analyze_with_claude(image_bytes):
     "ojop_count": число или null,
     "ojop_sum": число или null
   },
-  "analysis": "Короткий аналитический вывод на русском (3-5 предложений). Сравни факт с планом по % показателям (доходимость, конверсии, ROAS) — выполняем план или нет. Отметь что идёт хорошо, где просадки. Стиль: лаконично, по делу, как опытный маркетолог. НЕ сравнивай бюджет трафик и кол-во регистраций (они накопительные)."
+  "analysis": "Аналитический вывод на русском (3-5 предложений). Сравни факт с планом по % показателям (доходимость, конверсии, ROAS) — выполняем план или нет. Отметь что идёт хорошо, где просадки. Стиль: лаконично, по делу, как опытный маркетолог. НЕ сравнивай бюджет трафик и кол-во регистраций (они накопительные)."
 }
 
 Правила:
 - Проценты: число без знака % (55 а не 55%)
-- Доллары: число без знака $ (1540 а не $1540)  
+- Доллары: число без знака $ (1540 а не $1540)
 - #DIV/0!, пусто, прочерк → null
-- Верни ТОЛЬКО валидный JSON, без markdown и пояснений"""
+- viewers_all_peaks — это строка "Кол-во зрителей по всем пикам" из правой колонки
+- viewers_peak_1day — это строка "Кол-во зрителей пик по 1 дню" из правой колонки"""
 
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -154,7 +155,6 @@ def analyze_with_claude(image_bytes):
     return json.loads(text)
 
 def pct_status(fact_val, plan_val, higher_is_better=True):
-    """Returns emoji status based on % completion of plan"""
     if fact_val is None or plan_val is None or plan_val == 0:
         return "—", None
     pct = (fact_val / plan_val) * 100
@@ -169,26 +169,21 @@ def pct_status(fact_val, plan_val, higher_is_better=True):
     return emoji, pct
 
 def fmt_with_plan(fact_val, plan_val, suffix="", higher_is_better=True, prev_val=None):
-    """Format value with plan comparison and delta from previous day"""
     if fact_val is None:
         return "—"
-
     result = f"{fact_val}{suffix}"
-
     if plan_val is not None and plan_val != 0:
         emoji, pct = pct_status(fact_val, plan_val, higher_is_better)
         if pct is not None:
             diff = fact_val - plan_val
             sign = "+" if diff > 0 else ""
             result += f" {emoji} (план {plan_val}{suffix}, {sign}{diff:.1f}{suffix})"
-
     if prev_val is not None:
         delta = fact_val - prev_val
         if delta != 0:
             sign = "+" if delta > 0 else ""
             arr = "↑" if delta > 0 else "↓"
             result += f" {arr}{sign}{delta:.1f}{suffix} к вчера"
-
     return result
 
 def build_summary(parsed, prev=None):
@@ -210,7 +205,9 @@ def build_summary(parsed, prev=None):
         "🎯 *Трафик*",
         f"  Регистрации: {f.get('registrations', '—')} (план {p.get('registrations', '—')})",
         f"  Цена лида: {fmt_with_plan(f.get('lead_price'), p.get('lead_price'), '$', higher_is_better=False, prev_val=prev.get('lead_price'))}",
+        f"  Зрители пик 1д: {f.get('viewers_peak_1day', '—')}",
         f"  Доходимость 1д: {fmt_with_plan(f.get('reach_1day'), p.get('reach_1day'), '%', prev_val=prev.get('reach_1day'))}",
+        f"  Зрители все пики: {f.get('viewers_all_peaks', '—')}",
         f"  Доходимость все пики: {fmt_with_plan(f.get('reach_all_peaks'), p.get('reach_all_peaks'), '%', prev_val=prev.get('reach_all_peaks'))}",
         "",
         "📋 *Заявки и продажи*",
@@ -246,7 +243,6 @@ def build_summary(parsed, prev=None):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Читаю отчёт...")
-
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
