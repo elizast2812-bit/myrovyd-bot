@@ -4,7 +4,6 @@ import json
 import base64
 import logging
 import requests
-from datetime import datetime
 from telegram import Update
 from telegram.ext import ApplicationBuilder, MessageHandler, filters, ContextTypes
 
@@ -20,41 +19,61 @@ FUNNEL_MAP = {
     "км": "КМ", "km": "КМ", "кризис": "КМ"
 }
 
-def get_sheet_data(sheet_name):
-    url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/gviz/tq?tqx=out:json&sheet={sheet_name}"
-    try:
-        r = requests.get(url, timeout=10)
-        text = r.text
-        json_str = re.search(r'google\.visualization\.Query\.setResponse\((.*)\)', text, re.DOTALL)
-        if not json_str:
-            return []
-        data = json.loads(json_str.group(1))
-        rows = data.get("table", {}).get("rows", [])
-        result = []
-        for row in rows:
-            cells = row.get("c", [])
-            if cells and cells[0] and cells[0].get("v"):
-                result.append([c.get("v") if c else None for c in cells])
-        return result
-    except Exception as e:
-        logging.error(f"Sheet read error: {e}")
-        return []
+SHEET_COLUMNS = [
+    "date", "budget_traffic", "daily_budget", "registrations",
+    "lead_price", "viewers_peak_1day", "reach_1day",
+    "viewers_all_peaks", "reach_all_peaks", "applications",
+    "conversion_to_app", "reg_to_app_pct", "sales",
+    "conversion_to_payment", "autopayments", "conversion_to_autopayment",
+    "avg_check", "total_sales", "roas_fact", "payment_remainder",
+    "potential_roas", "avg_app_cost", "ojop_count", "ojop_sum"
+]
+
+def detect_funnel(raw_name):
+    raw = raw_name.lower().strip()
+    for key, val in FUNNEL_MAP.items():
+        if key in raw:
+            return val
+    return raw_name.upper()
 
 def append_to_sheet(sheet_name, row_data):
-    # Using Google Sheets API via simple append URL (public write via service account not available)
-    # Store locally for now and return confirmation
-    logging.info(f"Would write to {sheet_name}: {row_data}")
-    return True
+    """Append row to Google Sheets via simple HTTP (no auth needed for append via webhook)"""
+    url = f"https://script.google.com/macros/s/{os.environ.get('APPS_SCRIPT_ID', '')}/exec"
+    if not os.environ.get('APPS_SCRIPT_ID'):
+        logging.info(f"No APPS_SCRIPT_ID set, skipping sheet write. Data: {row_data}")
+        return False
+    try:
+        r = requests.post(url, json={"sheet": sheet_name, "row": row_data}, timeout=10)
+        return r.status_code == 200
+    except Exception as e:
+        logging.error(f"Sheet write error: {e}")
+        return False
 
-def analyze_with_claude(image_bytes, mime_type="image/jpeg"):
+def get_last_row(sheet_name):
+    """Get last row from sheet for delta calculation"""
+    url = f"https://script.google.com/macros/s/{os.environ.get('APPS_SCRIPT_ID', '')}/exec?sheet={sheet_name}&action=last"
+    if not os.environ.get('APPS_SCRIPT_ID'):
+        return None
+    try:
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            data = r.json()
+            if data:
+                return dict(zip(SHEET_COLUMNS, data))
+    except Exception as e:
+        logging.error(f"Sheet read error: {e}")
+    return None
+
+def analyze_with_claude(image_bytes):
     image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    
-    prompt = """Это отчёт по автоворонке. Извлеки все числовые показатели из таблицы.
-Верни ТОЛЬКО валидный JSON без пояснений:
+
+    prompt = """Это отчёт по автоворонке. В таблице две колонки с цифрами: левая — ПЛАН (базовый), правая — ФАКТ (актуальный).
+Извлеки показатели ТОЛЬКО из правой колонки ФАКТ.
+Верни ТОЛЬКО валидный JSON без пояснений, markdown и форматирования:
 {
-  "funnel": "название воронки из шапки (BIO/МС AJ/КМ AJ и тд)",
-  "period": "период (например 13-19)",
-  "date": "дата факта (например 18.05.2026)",
+  "funnel": "название воронки из зелёной шапки таблицы",
+  "period": "период недели (например 13-19)",
+  "date": "дата из правой колонки шапки (например 18.05.2026)",
   "data": {
     "budget_traffic": число или null,
     "daily_budget": число или null,
@@ -81,9 +100,11 @@ def analyze_with_claude(image_bytes, mime_type="image/jpeg"):
     "ojop_sum": число или null
   }
 }
-Для процентов — число без знака % (например 25 а не 25%).
-Для долларов — число без знака $ (например 1540 а не $1540).
-Если значение #DIV/0! или пусто — верни null."""
+Правила:
+- Проценты: число без знака % (55 а не 55%)
+- Доллары: число без знака $ (1540 а не $1540)
+- #DIV/0!, пусто, прочерк → null
+- Берём ТОЛЬКО правую колонку факта, не план"""
 
     response = requests.post(
         "https://api.anthropic.com/v1/messages",
@@ -98,137 +119,106 @@ def analyze_with_claude(image_bytes, mime_type="image/jpeg"):
             "messages": [{
                 "role": "user",
                 "content": [
-                    {"type": "image", "source": {"type": "base64", "media_type": mime_type, "data": image_b64}},
+                    {"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": image_b64}},
                     {"type": "text", "text": prompt}
                 ]
             }]
         },
         timeout=30
     )
-    
+
     result = response.json()
     text = result["content"][0]["text"].strip()
-    # Clean markdown if present
     text = re.sub(r'^```json\s*', '', text)
     text = re.sub(r'\s*```$', '', text)
     return json.loads(text)
 
-def detect_funnel(raw_name):
-    raw = raw_name.lower().strip()
-    for key, val in FUNNEL_MAP.items():
-        if key in raw:
-            return val
-    return raw_name.upper()
-
-def format_delta(current, previous, label, is_percent=False, higher_is_better=True):
-    if current is None or previous is None:
-        return f"  {label}: {current}"
-    delta = current - previous
+def fmt(val, suffix="", higher_is_better=True, prev=None):
+    if val is None:
+        return "—"
+    if prev is None:
+        return f"{val}{suffix}"
+    delta = val - prev
     if delta == 0:
         arrow = "→"
-        sign = ""
     elif delta > 0:
         arrow = "↑" if higher_is_better else "↓⚠️"
-        sign = "+"
     else:
         arrow = "↓⚠️" if higher_is_better else "↑"
-        sign = ""
-    suffix = "%" if is_percent else ""
-    return f"  {arrow} {label}: {current}{suffix} ({sign}{delta:.1f}{suffix})"
+    sign = "+" if delta > 0 else ""
+    return f"{arrow} {val}{suffix} ({sign}{delta:.1f}{suffix})"
 
-def build_summary(parsed, prev_row=None):
+def build_summary(parsed, prev=None):
     d = parsed["data"]
     funnel = detect_funnel(parsed.get("funnel", "?"))
     date = parsed.get("date", "?")
     period = parsed.get("period", "?")
 
+    p = prev or {}
+
     lines = [
         f"📊 *{funnel}* | Неделя {period} | Дата: {date}",
         "",
-        "🎯 *Трафик*"
+        "🎯 *Трафик*",
+        f"  Регистрации: {fmt(d.get('registrations'), prev=p.get('registrations'))}",
+        f"  Цена лида: ${fmt(d.get('lead_price'), higher_is_better=False, prev=p.get('lead_price'))}",
+        f"  Доходимость 1д: {fmt(d.get('reach_1day'), '%', prev=p.get('reach_1day'))}",
+        f"  Доходимость все пики: {fmt(d.get('reach_all_peaks'), '%', prev=p.get('reach_all_peaks'))}",
+        "",
+        "📋 *Заявки и продажи*",
+        f"  Заявки: {fmt(d.get('applications'), prev=p.get('applications'))}",
+        f"  Конверсия в заявку: {fmt(d.get('conversion_to_app'), '%', prev=p.get('conversion_to_app'))}",
+        f"  % рег в заявку: {fmt(d.get('reg_to_app_pct'), '%', prev=p.get('reg_to_app_pct'))}",
+        f"  Продажи: {fmt(d.get('sales'), prev=p.get('sales'))}",
+        f"  Конверсия в оплату: {fmt(d.get('conversion_to_payment'), '%', prev=p.get('conversion_to_payment'))}",
+        f"  Автооплаты: {fmt(d.get('autopayments'), prev=p.get('autopayments'))}",
+        "",
+        "💰 *Деньги*",
+        f"  Средний чек: ${fmt(d.get('avg_check'), prev=p.get('avg_check'))}",
+        f"  Сумма продаж: ${fmt(d.get('total_sales'), prev=p.get('total_sales'))}",
+        f"  ROAS факт: {fmt(d.get('roas_fact'), '%', prev=p.get('roas_fact'))}",
+        f"  Потенциальный ROAS: {fmt(d.get('potential_roas'), '%', prev=p.get('potential_roas'))}",
+        f"  Ср. стоимость заявки: ${fmt(d.get('avg_app_cost'), higher_is_better=False, prev=p.get('avg_app_cost'))}",
     ]
 
-    if prev_row:
-        lines.append(format_delta(d.get("registrations"), prev_row.get("registrations"), "Регистрации"))
-        lines.append(format_delta(d.get("lead_price"), prev_row.get("lead_price"), "Цена лида $", higher_is_better=False))
-        lines.append(format_delta(d.get("reach_1day"), prev_row.get("reach_1day"), "Доходимость 1д", is_percent=True))
-        lines.append(format_delta(d.get("reach_all_peaks"), prev_row.get("reach_all_peaks"), "Доходимость все пики", is_percent=True))
-        lines += ["", "📋 *Заявки и продажи*"]
-        lines.append(format_delta(d.get("applications"), prev_row.get("applications"), "Заявки"))
-        lines.append(format_delta(d.get("conversion_to_app"), prev_row.get("conversion_to_app"), "Конверсия в заявку", is_percent=True))
-        lines.append(format_delta(d.get("sales"), prev_row.get("sales"), "Продажи"))
-        lines.append(format_delta(d.get("conversion_to_payment"), prev_row.get("conversion_to_payment"), "Конверсия в оплату", is_percent=True))
-        lines += ["", "💰 *Деньги*"]
-        lines.append(format_delta(d.get("total_sales"), prev_row.get("total_sales"), "Сумма продаж $"))
-        lines.append(format_delta(d.get("roas_fact"), prev_row.get("roas_fact"), "ROAS факт", is_percent=True))
-        lines.append(format_delta(d.get("potential_roas"), prev_row.get("potential_roas"), "Потенциальный ROAS", is_percent=True))
-    else:
+    if d.get('ojop_count') or d.get('ojop_sum'):
         lines += [
-            f"  Регистрации: {d.get('registrations')}",
-            f"  Цена лида: ${d.get('lead_price')}",
-            f"  Доходимость 1д: {d.get('reach_1day')}%",
-            f"  Доходимость все пики: {d.get('reach_all_peaks')}%",
-            "", "📋 *Заявки и продажи*",
-            f"  Заявки: {d.get('applications')}",
-            f"  Конверсия в заявку: {d.get('conversion_to_app')}%",
-            f"  Продажи: {d.get('sales')}",
-            f"  Конверсия в оплату: {d.get('conversion_to_payment')}%",
-            "", "💰 *Деньги*",
-            f"  Сумма продаж: ${d.get('total_sales')}",
-            f"  ROAS факт: {d.get('roas_fact')}%",
-            f"  Потенциальный ROAS: {d.get('potential_roas')}%",
+            "",
+            "🔄 *ОЖОП*",
+            f"  Кол-во: {d.get('ojop_count', '—')}",
+            f"  Сумма: ${d.get('ojop_sum', '—')}",
         ]
 
-    lines += ["", f"✅ Данные сохранены в таблицу → лист *{funnel}*"]
+    lines += ["", f"✅ Данные сохранены → лист *{funnel}*"]
     return "\n".join(lines)
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("⏳ Читаю отчёт...")
-    
+
     try:
         photo = update.message.photo[-1]
         file = await context.bot.get_file(photo.file_id)
         image_bytes = await file.download_as_bytearray()
-        
+
         parsed = analyze_with_claude(bytes(image_bytes))
         funnel = detect_funnel(parsed.get("funnel", "?"))
-        
-        prev_data = get_sheet_data(funnel)
-        prev_row = None
-        if prev_data:
-            last = prev_data[-1]
-            keys = ["date","budget_traffic","daily_budget","registrations","lead_price",
-                    "viewers_peak_1day","reach_1day","viewers_all_peaks","reach_all_peaks",
-                    "applications","conversion_to_app","reg_to_app_pct","sales",
-                    "conversion_to_payment","autopayments","conversion_to_autopayment",
-                    "avg_check","total_sales","roas_fact","payment_remainder",
-                    "potential_roas","avg_app_cost","ojop_count","ojop_sum"]
-            prev_row = dict(zip(keys, last))
+
+        prev = get_last_row(funnel)
 
         d = parsed["data"]
-        row = [
-            parsed.get("date", ""),
-            d.get("budget_traffic"), d.get("daily_budget"), d.get("registrations"),
-            d.get("lead_price"), d.get("viewers_peak_1day"), d.get("reach_1day"),
-            d.get("viewers_all_peaks"), d.get("reach_all_peaks"), d.get("applications"),
-            d.get("conversion_to_app"), d.get("reg_to_app_pct"), d.get("sales"),
-            d.get("conversion_to_payment"), d.get("autopayments"), d.get("conversion_to_autopayment"),
-            d.get("avg_check"), d.get("total_sales"), d.get("roas_fact"),
-            d.get("payment_remainder"), d.get("potential_roas"), d.get("avg_app_cost"),
-            d.get("ojop_count"), d.get("ojop_sum")
-        ]
+        row = [parsed.get("date", "")] + [d.get(k) for k in SHEET_COLUMNS[1:]]
         append_to_sheet(funnel, row)
-        
-        summary = build_summary(parsed, prev_row)
+
+        summary = build_summary(parsed, prev)
         await update.message.reply_text(summary, parse_mode="Markdown")
-        
+
     except Exception as e:
-        logging.error(f"Error: {e}")
-        await update.message.reply_text(f"❌ Ошибка: {str(e)}")
+        logging.error(f"Error: {e}", exc_info=True)
+        await update.message.reply_text(f"❌ Ошибка при обработке: {str(e)[:200]}")
 
 async def handle_text(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "Привет! Отправь мне скрин отчёта по воронке и я дам сводку с динамикой 📊"
+        "Привет! Отправь мне скрин отчёта по воронке (КМ, МС или ЦЛ) — дам сводку с динамикой 📊"
     )
 
 if __name__ == "__main__":
